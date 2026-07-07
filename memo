@@ -1,102 +1,191 @@
-    def _compute_lateral_shift(self):
-        obstacles = getattr(self, "_dynamic_obstacles", None)
-        waypoint_xy = getattr(self, "_waypoint_xy", None)
-        if not hasattr(self, "_reference_path") or not hasattr(self, "_car"):
-            return None
-        if (not obstacles or waypoint_xy is None or waypoint_xy.size == 0) \
-                and self._avoid_state == "IDLE":
-            return None
+    方式:
+        MPCのコスト項を足すのではなく、目標横位置(コリドー中心)を他車の逆側へ
+        ずらすことで回避する。距離ペナルティを直接コスト化すると非凸になり
+        OSQPが解けない/吸い寄せられるが、目標をずらすだけなら凸のまま解ける。
 
-        N = int(self._mpc.N)
-        ego_wp = int(self._mpc.model.wp_id)
-        n_wp = len(waypoint_xy)
-        wps = waypoint_xy
-        now = self.get_clock().now().nanoseconds * 1e-9
-        max_width = float(self._cfg.reference_path.max_width)  # type: ignore
-        ego_radius = float(self._car.width) / 2.0
-        alpha = 0.20
+    戻り値:
+        長さ N の np.ndarray（各予測ステップの横シフト量[m]、符号付き）
+        回避不要のときは None（Noneを渡すとMPC側は従来通りコリドー中心を狙う）
 
-        # 1秒あたり進行wp数（リード判定用）。要実測調整。
-        wp_per_sec = float(getattr(self, "_wp_per_sec_est", 10.0))
-        # 自車長の半分を wp 換算（要実測。1wpの距離で割る）
-        half_len_wp = float(getattr(self, "_half_len_wp", 2.0))
+    状態機械（2状態）:
+        ① IDLE     … 通常走行。目標は元経路。
+        ② AVOIDING … 回避中。②遷移時に「起点・向き・幅」を一度だけラッチして固定し、
+                      以降はそれを動かさない。→ 他車が動いても目標経路が痙攣しない。
 
-        # --- 最近傍の前方他車を1台選ぶ ---
-        best = None  # (gap, e_y_obs, obs_wp, wp)
-        for ob in obstacles or []:
-            dxy = wps - np.array([ob.cx, ob.cy], dtype=np.float64)
-            obs_wp = int(np.argmin(np.einsum('ij,ij->i', dxy, dxy)))
-            gap = (obs_wp - ego_wp) % n_wp
-            wp = self._reference_path.get_waypoint(obs_wp)
-            e_y_obs = (-np.sin(wp.psi) * (ob.cx - wp.x)
-                       + np.cos(wp.psi) * (ob.cy - wp.y))
-            if abs(e_y_obs) > max_width:
-                continue
-            if best is None or gap < best[0]:
-                best = (gap, e_y_obs, obs_wp, wp)
+    遷移:
+        ①→②: 前方他車が自車ホライゾンの中央法線上(gap≒N/2)に来たとき
+        ②→①: 自車が他車を「自車長半分以上・1秒以上」リード、または②に10秒滞在
+    """
+    # --- 前提となる属性の存在チェック（選択肢2で常時初期化されている想定）---
+    # 回避OFFでも _dynamic_obstacles / _waypoint_xy が初期化されている前提だが、
+    # 初期化順序の事故に備えて getattr で安全に取得する。
+    obstacles = getattr(self, "_dynamic_obstacles", None)
+    waypoint_xy = getattr(self, "_waypoint_xy", None)
 
-        # ===== ①→② 遷移 =====
-        if self._avoid_state == "IDLE":
-            if best is not None:
-                gap, e_y_obs, obs_wp, wp = best
-                # ホライゾン中央法線上に他車
-                if N * 0.45 <= gap <= N * 0.55:
-                    # 余白の多い側 = 他車が右(e_y<0)なら左(+)、逆も。
-                    # より厳密には「壁までの余白が大きい側」。ここでは他車の逆側。
-                    direction = -np.sign(e_y_obs) if e_y_obs != 0.0 else 1.0
-                    # 立ち上げ方向の壁までの距離。コリドー半幅 = max_width/2。
-                    wall_dist = max_width / 2.0
-                    # 既存目標経路(中心=0)から、壁側へ寄せられる最大量
-                    # = 壁までの距離 - (自車半径+α)
-                    max_shift = abs((wall_dist - (ego_radius + alpha)) - 0.0)
-                    self._avoid_state = "AVOIDING"
-                    self._avoid_dir = direction
-                    self._avoid_s_start = float(obs_wp)
-                    self._avoid_max_shift = max(max_shift, 0.0)
-                    self._avoid_t_start = now
-                    self._lead_t_start = None
-            if self._avoid_state == "IDLE":
-                return None
+    # 参照経路・車両モデルが未準備なら何もしない（起動直後の保険）
+    if not hasattr(self, "_reference_path") or not hasattr(self, "_car"):
+        return None
 
-        # ===== ② 中：終了判定 =====
-        elapsed = now - self._avoid_t_start
+    # 他車情報が無く、かつ現在 IDLE のときだけ早期リターン。
+    # ※ AVOIDING 中は他車を見失っても継続したい（終了判定は下の状態機械で行う）
+    #   ので、ここで return せず処理を続ける。
+    if (not obstacles or waypoint_xy is None or waypoint_xy.size == 0) \
+            and self._avoid_state == "IDLE":
+        return None
 
-        # リード判定: 自車が他車前方に、自車長半分以上リード
-        leading = False
+    # === 基本量の準備 ===
+    N = int(self._mpc.N)                        # 予測ホライゾン長[step]
+    ego_wp = int(self._mpc.model.wp_id)         # 自車の現在waypoint（絶対index）
+    n_wp = len(waypoint_xy)                     # コース全waypoint数（周回の折返しに使用）
+    wps = waypoint_xy                           # 全waypointのxy座標 shape=(n_wp, 2)
+    now = self.get_clock().now().nanoseconds * 1e-9   # 現在時刻[s]（10s/1s判定用）
+
+    # コース幅・自車サイズ（最大回避幅の計算に使用）
+    max_width = float(self._cfg.reference_path.max_width)  # type: ignore  # コリドー全幅[m]
+    ego_radius = float(self._car.width) / 2.0             # 自車の半幅[m]
+    alpha = 0.20                                          # 壁からの追加安全余白[m]
+
+    # --- リード判定用の単位換算（いずれも要実測調整）---
+    # 1秒あたりに進む waypoint 数。速度×制御周期÷wp間隔の近似。
+    # ずれても「終了判定の厳しさ」が前後するだけで破綻はしない。
+    wp_per_sec = float(getattr(self, "_wp_per_sec_est", 10.0))
+    # 自車長の半分を waypoint 数に換算した値（1wpの実距離で割った近似）。
+    # 「自車長半分リード」の閾値に使う。
+    half_len_wp = float(getattr(self, "_half_len_wp", 2.0))
+
+    # === 最近傍の前方他車を1台だけ選ぶ ===
+    # 複数台いても、いちばん近い前方車(gap最小)だけを回避対象にする。
+    # best = (gap, e_y_obs, obs_wp, wp)
+    #   gap     : 自車から見た前方距離[wp]（周回考慮の剰余）
+    #   e_y_obs : 他車のコース中心からの符号付き横ずれ[m]（+左 / -右）
+    #   obs_wp  : 他車を投影した最近傍waypoint（絶対index）
+    #   wp      : その waypoint オブジェクト
+    best = None
+    for ob in obstacles or []:
+        # 他車位置(ob.cx, ob.cy)を全waypointに対して最近傍探索し、投影先wpを求める
+        dxy = wps - np.array([ob.cx, ob.cy], dtype=np.float64)
+        obs_wp = int(np.argmin(np.einsum('ij,ij->i', dxy, dxy)))  # 二乗距離最小のindex
+
+        # 前方距離[wp]。周回コースなので剰余で 0..n_wp-1 に正規化。
+        gap = (obs_wp - ego_wp) % n_wp
+
+        # 投影先waypointの向き(psi)を使い、他車の左右(符号付き横ずれ)を計算。
+        # 法線方向 = (-sin psi, cos psi) との内積。+なら左、-なら右。
+        wp = self._reference_path.get_waypoint(obs_wp)
+        e_y_obs = (-np.sin(wp.psi) * (ob.cx - wp.x)
+                   + np.cos(wp.psi) * (ob.cy - wp.y))
+
+        # コース幅を大きく外れる他車は「絡まない相手」として無視。
+        if abs(e_y_obs) > max_width:
+            continue
+
+        # より近い前方車で更新（gapが小さいほど近い）
+        if best is None or gap < best[0]:
+            best = (gap, e_y_obs, obs_wp, wp)
+
+    # ============================================================
+    # ①→② 遷移判定（現在 IDLE のときだけ）
+    # ============================================================
+    if self._avoid_state == "IDLE":
         if best is not None:
-            # 他車が自車の後ろにどれだけいるか
-            behind = (ego_wp - best[2]) % n_wp
-            if 0 < behind < n_wp * 0.5 and behind >= half_len_wp:
-                leading = True
-        else:
-            leading = True  # 前方に他車なし=抜けた
+            gap, e_y_obs, obs_wp, wp = best
 
-        if leading:
-            if self._lead_t_start is None:
-                self._lead_t_start = now
-        else:
-            self._lead_t_start = None
-        led_1s = (self._lead_t_start is not None
-                  and now - self._lead_t_start >= 1.0)
+            # 【開始条件】前方他車がホライゾン中央法線上(gap≒N/2)に来たか。
+            # 窓を狭くしすぎると中央を通り抜ける瞬間を取りこぼすので、
+            # 実走で遷移しないようなら 0.4〜0.6 に広げる。
+            if N * 0.45 <= gap <= N * 0.55:
+                # 【回避方向を決定してラッチ】余白の多い側＝他車の逆側へ。
+                #   他車が右(e_y_obs<0) → 左(+1)へ
+                #   他車が左(e_y_obs>0) → 右(-1)へ
+                # ※ 実車のpsi定義が想定と逆で左右が反転する場合は、
+                #   この符号を反転する（direction = +np.sign(e_y_obs)）。
+                direction = -np.sign(e_y_obs) if e_y_obs != 0.0 else 1.0
 
-        # ②→① : 1sリード or 10s滞在
-        if led_1s or elapsed >= 10.0:
-            self._avoid_state = "IDLE"
-            self._lead_t_start = None
+                # 【最大回避幅を計算してラッチ】
+                # 定義: 既存目標経路(=コリドー中心, e_y=0)から、
+                #       壁ぎりぎり(自車半径+α だけ内側)まで寄せられる距離。
+                #   wall_dist  : 目標経路から立ち上げ方向の壁までの距離
+                #                = コリドー半幅 max_width/2（中心対称の前提）
+                #   max_shift  = |wall_dist - (自車半径 + α)|
+                # ※ 目標経路が中心からずれている(非対称)コースでは、
+                #   wall_dist を実際の左右別々の壁距離に置き換える必要がある。
+                wall_dist = max_width / 2.0
+                max_shift = abs((wall_dist - (ego_radius + alpha)) - 0.0)
+
+                # 【状態を AVOIDING へ遷移し、起点・向き・幅・開始時刻を固定】
+                # ここで固定した値は AVOIDING 中いっさい更新しない（＝目標が動かない）。
+                self._avoid_state = "AVOIDING"
+                self._avoid_dir = direction              # 回避方向(+/-)
+                self._avoid_s_start = float(obs_wp)      # S字の起点(絶対wp)
+                self._avoid_max_shift = max(max_shift, 0.0)  # 最大回避幅[m]（負防止）
+                self._avoid_t_start = now                # 回避開始時刻[s]
+                self._lead_t_start = None                # リード成立の起点をリセット
+
+        # 遷移しなかった（まだ IDLE のまま）なら回避なし
+        if self._avoid_state == "IDLE":
             return None
 
-        # ===== プロファイル生成（起点・向き・幅はラッチ済み固定）=====
-        k = np.arange(N, dtype=np.float64)
-        abs_wp = ego_wp + k
-        rise_wp = 6.0
-        steep = 3.0
-        d = (abs_wp - self._avoid_s_start + n_wp/2) % n_wp - n_wp/2
-        sig = 1.0 / (1.0 + np.exp(-steep * d / rise_wp))
-        sig = np.where(d >= 0, 1.0, sig)
-        shift = self._avoid_dir * self._avoid_max_shift * sig
+    # ============================================================
+    # ここから下は AVOIDING 状態の処理
+    # ============================================================
+    elapsed = now - self._avoid_t_start   # 回避開始からの経過時間[s]
 
-        self.get_logger().info(
-            f"[avoid] AVOIDING dir={self._avoid_dir:+.0f} "
-            f"maxw={self._avoid_max_shift:.2f} elapsed={elapsed:.1f} "
-            f"lead1s={led_1s}")
-        return shift
+    # --- リード判定: 自車が他車を「自車長半分以上」前に出ているか ---
+    leading = False
+    if best is not None:
+        # 他車が自車の「後ろ」にどれだけいるか[wp]。
+        # (ego_wp - obs_wp) の剰余。小さい正の値なら自車がわずかに前。
+        behind = (ego_wp - best[2]) % n_wp
+        # 後方かつ半周未満(=本当に後ろ) かつ 自車長半分以上リード
+        if 0 < behind < n_wp * 0.5 and behind >= half_len_wp:
+            leading = True
+    else:
+        # 前方に他車が見当たらない＝既に抜き切ったとみなす
+        leading = True
+
+    # リードが「継続」しているかを時間で見る（一瞬のノイズで終了しないため）。
+    # リード成立した瞬間の時刻を記録し、途切れたらリセット。
+    if leading:
+        if self._lead_t_start is None:
+            self._lead_t_start = now   # リード継続の計測開始
+    else:
+        self._lead_t_start = None      # リード途切れ→計測リセット
+    # リードが1秒以上継続したか
+    led_1s = (self._lead_t_start is not None
+              and now - self._lead_t_start >= 1.0)
+
+    # --- ②→① 終了判定: 「1秒リード」または「10秒滞在」で回避終了 ---
+    if led_1s or elapsed >= 10.0:
+        self._avoid_state = "IDLE"
+        self._lead_t_start = None
+        return None   # 元経路へ復帰
+
+    # ============================================================
+    # プロファイル生成（起点・向き・幅はラッチ済みなので毎周期同じ形）
+    # ============================================================
+    # 各予測ステップ k(0..N-1) が指すコース上の絶対wpを近似（1step≒1wp）。
+    k = np.arange(N, dtype=np.float64)
+    abs_wp = ego_wp + k
+
+    # シグモイドの形状パラメータ（調整用）
+    rise_wp = 6.0   # 立ち上がり幅[wp]。大きいほど緩やか＝安定だが反応が鈍い。
+    steep = 3.0     # 急峻さ。大きいほど直前で急に曲がる。
+
+    # ラッチした起点 _avoid_s_start からの符号付き距離[wp]（周回の巻き戻り考慮）。
+    # d<0: 起点より手前, d=0: 起点, d>0: 起点より先
+    d = (abs_wp - self._avoid_s_start + n_wp / 2) % n_wp - n_wp / 2
+
+    # シグモイドで 0→1 に滑らかに立ち上げ、起点(d>=0)以降は最大幅で頭打ち。
+    sig = 1.0 / (1.0 + np.exp(-steep * d / rise_wp))
+    sig = np.where(d >= 0, 1.0, sig)
+
+    # 最終シフト量 = 方向 × 最大幅 × プロファイル（各ステップ分の配列）
+    shift = self._avoid_dir * self._avoid_max_shift * sig
+
+    # デバッグログ: 状態/方向/最大幅/経過秒/リード成立 を毎周期出力。
+    # head が [0. .. 徐々に増加 .. max] の形になっていれば正常。
+    self.get_logger().info(
+        f"[avoid] AVOIDING dir={self._avoid_dir:+.0f} "
+        f"maxw={self._avoid_max_shift:.2f} elapsed={elapsed:.1f} "
+        f"lead1s={led_1s}")
+    return shift
