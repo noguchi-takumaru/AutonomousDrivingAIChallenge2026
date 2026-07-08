@@ -1,4 +1,4 @@
-def _compute_lateral_shift(self):
+    def _compute_lateral_shift(self):
         """
         他車回避のための「目標横位置シフト量[m]」を毎周期計算して返す（ルートB / 案A）。
 
@@ -16,9 +16,14 @@ def _compute_lateral_shift(self):
             ② AVOIDING … 回避中。②遷移時に「起点・向き・幅」を一度だけラッチして固定し、
                           以降はそれを動かさない。→ 他車が動いても目標経路が痙攣しない。
 
+        「ホライゾン上に他車がいるか」の判定方式:
+            MPCが予測したホライゾン経路の実座標(self._mpc.current_prediction)と
+            他車位置の最小距離で直接判定する。予測経路は自車前方にしか伸びないため、
+            この距離判定だけで「前方か」「道幅内か」を同時に確定できる（後方は自動で除外）。
+            → 剰余gapによる前後判定(旧・条件A)は不要になった。
+
         遷移:
-            ①→②: 前方他車が「自車ホライゾンの半分より手前」かつ
-                  「道幅の法線線分の内側(lb..ub)」に入ったとき
+            ①→②: 他車がホライゾン上（予測経路の近傍）かつ「半分より手前」に来たとき
             ②→①: 自車が他車を「自車長半分以上・1秒以上」リード、または②に10秒滞在
         """
         # --- 前提となる属性の存在チェック（選択肢2で常時初期化されている想定）---
@@ -46,44 +51,57 @@ def _compute_lateral_shift(self):
         ego_radius = float(self._car.width) / 2.0   # 自車の半幅[m]
         alpha = 0.20                                # 壁からの追加安全余白[m]
 
-        # --- リード判定用の単位換算（いずれも要実測調整）---
-        # 1秒あたりに進む waypoint 数（現状は未使用だが将来のリード距離換算用に保持）。
-        wp_per_sec = float(getattr(self, "_wp_per_sec_est", 10.0))
         # 自車長の半分を waypoint 数に換算した値。「自車長半分リード」の閾値。
         half_len_wp = float(getattr(self, "_half_len_wp", 2.0))
 
+        # ホライゾン上とみなす横距離しきい値[m]（予測経路の点から他車までの許容距離）。
+        # 大きすぎると横の車まで拾い、小さすぎると真上の車しか拾わない。要調整。
+        corridor_half = float(self._cfg.reference_path.max_width)  # type: ignore
+
+        # === MPCが予測したホライゾンの実座標（長さN）を取得 ===
+        # get_control() 内で更新される。_compute_lateral_shift は get_control の直前に
+        # 呼ばれるため、参照するのは「前周期の予測経路」（1周期古いが連続的で実用上OK）。
+        pred = getattr(self._mpc, "current_prediction", None)
+        if pred is not None:
+            pred_xy = np.column_stack([pred[0], pred[1]])  # shape (N, 2)
+        else:
+            pred_xy = None
+
         # === ホライゾン上（前方かつ道幅内）の他車を1台選ぶ ===
         # best = (gap, e_y_obs, obs_wp, wp)
-        #   gap     : 前方距離[wp]。後方は負（下の剰余処理参照）
+        #   gap     : 前方距離[step]（予測経路上で自車から何ステップ先か）
         #   e_y_obs : 他車のコース中心からの符号付き横ずれ[m]（+左 / -右）
         #   obs_wp  : 他車を投影した最近傍waypoint（絶対index）
         #   wp      : その waypoint（lb/ub=実測道幅, psi=向き を持つ）
         best = None
         for ob in obstacles or []:
-            # 他車位置を全waypointに最近傍投影
-            dxy = wps - np.array([ob.cx, ob.cy], dtype=np.float64)
+            ob_xy = np.array([ob.cx, ob.cy], dtype=np.float64)
+
+            # --- ホライゾン上か & 前方距離を、予測経路との最小距離で直接判定 ---
+            if pred_xy is not None:
+                dists = np.linalg.norm(pred_xy - ob_xy, axis=1)  # 各予測点までの距離
+                hit_idx = int(np.argmin(dists))                  # 最も近い予測点のindex
+                if dists[hit_idx] > corridor_half:
+                    continue   # ホライゾンから横に離れている→無視
+                # 予測経路indexは「自車から何step先か」= 前方距離そのもの。
+                # 予測経路は前方にしか伸びないので、後方車は自動的に遠くなり弾かれる。
+                gap = hit_idx
+            else:
+                # 予測経路が無い起動直後は、参照経路wp投影にフォールバック。
+                dxy0 = wps - ob_xy
+                obs_wp0 = int(np.argmin(np.einsum('ij,ij->i', dxy0, dxy0)))
+                raw = (obs_wp0 - ego_wp) % n_wp
+                gap = raw if raw <= n_wp / 2 else raw - n_wp
+                if not (0 < gap < N):
+                    continue
+
+            # --- 左右（回避方向）決定用に、他車を参照経路wpへ投影して横ずれを得る ---
+            # 「ホライゾン上か」の判定とは切り離し、符号付き横ずれの算出のみに使う。
+            dxy = wps - ob_xy
             obs_wp = int(np.argmin(np.einsum('ij,ij->i', dxy, dxy)))
-
-            # --- 条件A(前提): 前方距離。剰余の半周超えは「後方」とみなし負にする ---
-            # 周回コースで (obs_wp-ego_wp)%n_wp をそのまま使うと、後方の車が
-            # 「はるか前方」に化けて誤検知する。半周を超えたら負に折り返して除外する。
-            raw = (obs_wp - ego_wp) % n_wp
-            gap = raw if raw <= n_wp / 2 else raw - n_wp
-            # 前方(gap>0)かつホライゾン内(gap<N)だけ対象。後方・遠方は無視。
-            if not (0 < gap < N):
-                continue
-
-            # --- 他車の符号付き横ずれ（法線方向の距離）---
-            # 法線方向 = (-sin psi, cos psi) との内積。+なら左、-なら右。
             wp = self._reference_path.get_waypoint(obs_wp)
             e_y_obs = (-np.sin(wp.psi) * (ob.cx - wp.x)
                        + np.cos(wp.psi) * (ob.cy - wp.y))
-
-            # --- 条件B: ホライゾンの法線線分（＝道幅 lb..ub）の内側にいるか ---
-            # wp.lb=右壁までの距離(負), wp.ub=左壁までの距離(正)。
-            # この範囲を外れて横に離れた車は「絡まない相手」として無視。
-            if not (wp.lb <= e_y_obs <= wp.ub):
-                continue
 
             # 前方で最も近い車を選ぶ（gapが小さいほど近い）
             if best is None or gap < best[0]:
@@ -96,9 +114,9 @@ def _compute_lateral_shift(self):
             if best is not None:
                 gap, e_y_obs, obs_wp, wp = best
 
-                # 【開始条件A（本体）】他車がホライゾンの半分より手前に来たか。
-                # （条件B=道幅内 は上のループで既に満たしている）
-                if 0 < gap <= N / 2:
+                # 【開始条件】他車がホライゾンの半分より手前に来たか。
+                # （「ホライゾン上か」は上のループの距離判定で既に満たしている）
+                if 0 <= gap <= N / 2:
                     # 【回避方向を決定してラッチ】余白の多い側＝他車の逆側へ。
                     #   他車が右(e_y_obs<0) → 左(+1)へ / 他車が左(e_y_obs>0) → 右(-1)へ
                     # ※ psi定義が想定と逆で左右が反転する場合はこの符号を反転。
@@ -142,7 +160,7 @@ def _compute_lateral_shift(self):
             if 0 < behind < n_wp * 0.5 and behind >= half_len_wp:
                 leading = True
         else:
-            # 前方（道幅内）に他車が見当たらない＝抜き切ったとみなす
+            # ホライゾン上（前方）に他車が見当たらない＝抜き切ったとみなす
             leading = True
 
         # リードが「継続」しているかを時間で見る（一瞬のノイズで終了しないため）。
