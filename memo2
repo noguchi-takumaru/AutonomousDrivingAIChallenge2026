@@ -1,12 +1,11 @@
         # ============================================================
-        # ブースト要求判定（他車なし & 直線 & 残回数>0 & 回避していない）
-        #   結果は self._boost_request に書き、_control 側が読んで発動する。
+        # ブースト要求判定（回避状態とは独立）
+        #   ホライゾンが直線 & ホライゾンを自車幅太らせた帯に他車なし & 残回数>0
+        #   → self._boost_request を立て、_control 側が読んで発動する。
         # ============================================================
         self._boost_request = False
-        if self._boost_count_left > 0 and self._avoid_state == "IDLE":
-            # --- ① ホライゾンを自車幅まで太らせた帯の中に他車がいないか ---
-            # 予測経路(自車の中心線)の各点から他車中心までの最小距離が
-            # (自車半幅 + 他車半径 + 余白) 以内なら、進路上に他車ありとみなす。
+        if self._boost_count_left > 0:
+            # --- 帯に他車がいないか（予測経路=進路の各点から他車中心までの最小距離）---
             no_car_ahead = True
             boost_clear = ego_radius + float(self._v2x_vehicle_radius) + 0.10  # 帯の半幅[m]
             if pred_xy is not None and obstacles:
@@ -16,7 +15,7 @@
                         no_car_ahead = False
                         break
 
-            # --- ② ホライゾン全域が直線か（曲率が全部小さい）---
+            # --- ホライゾン全域が直線か（曲率が全部小さい）---
             straight = True
             kappa_thresh = 0.05   # [1/m] 直線とみなす曲率上限。要調整。
             for i in range(N):
@@ -25,5 +24,4 @@
                     straight = False
                     break
 
-            if no_car_ahead and straight:
-                self._boost_request = True
+            self._boost_request = no_car_ahead and straight
