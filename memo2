@@ -1,27 +1,23 @@
-        # ============================================================
-        # ブースト要求判定（回避状態とは独立）
-        #   ホライゾンが直線 & ホライゾンを自車幅太らせた帯に他車なし & 残回数>0
-        #   → self._boost_request を立て、_control 側が読んで発動する。
-        # ============================================================
-        self._boost_request = False
-        if self._boost_count_left > 0:
-            # --- 帯に他車がいないか（予測経路=進路の各点から他車中心までの最小距離）---
-            no_car_ahead = True
-            boost_clear = ego_radius + float(self._v2x_vehicle_radius) + 0.10  # 帯の半幅[m]
-            if pred_xy is not None and obstacles:
-                for ob in obstacles:
-                    ob_xy = np.array([ob.cx, ob.cy], dtype=np.float64)
-                    if np.min(np.linalg.norm(pred_xy - ob_xy, axis=1)) <= boost_clear:
-                        no_car_ahead = False
-                        break
+        acc = 0.
+        bug_acc_enabled = False
+        if self.USE_BUG_ACC:
+            def deg2rad(deg):
+                return deg * np.pi / 180.0
 
-            # --- ホライゾン全域が直線か（曲率が全部小さい）---
-            straight = True
-            kappa_thresh = 0.05   # [1/m] 直線とみなす曲率上限。要調整。
-            for i in range(N):
-                wpi = self._reference_path.get_waypoint(ego_wp + i)
-                if abs(wpi.kappa) > kappa_thresh:
-                    straight = False
-                    break
-
-            self._boost_request = no_car_ahead and straight
+            if abs(v) > kmh_to_m_per_sec(44.0) or \
+             (abs(v) > kmh_to_m_per_sec(38.0) and abs(max_delta) > deg2rad(12.0)):
+                bug_acc_enabled = False
+                acc = self._mpc_cfg.a_min / 3.0 * 2.0
+                self._pred_marker_color = RED
+            elif abs(v) > kmh_to_m_per_sec(41.0) or abs(u[1]) > deg2rad(10.0):
+                bug_acc_enabled = False
+                acc = self._mpc_cfg.a_max
+                self._pred_marker_color = YELLOW
+            else:
+                bug_acc_enabled = True
+                acc = 500.0
+                self._pred_marker_color = CYAN
+        else:
+            acc =  self.KP * (u[0] - v)
+            # print(f"v: {v}, u[0]: {u[0]}, acc: {acc}")
+            acc = np.clip(acc, self._mpc_cfg.a_min, self._mpc_cfg.a_max)
